@@ -1,0 +1,364 @@
+---
+title: "Heterogeneity_11/28/22"
+output:
+  pdf_document: default
+  html_document: default
+date: "2022-11-28"
+---
+##Installing appropriate packages
+```{r}
+library("Seurat")
+library("BiocManager")
+library("tidyverse")
+library(dplyr)
+```
+
+##Loading in the data
+First, the appropriate directory was identified where the barcodes, genes, and matrix files were located. The data is then read by the Read10X function within the Seurat package into an expression matrix. This expression matrix contains the counts that will be inputted into the Seurat Object. 
+```{r}
+#Identify the appropriate directory
+data_dir <- '/Users/madeleinefalby/Desktop/scRNAseq data/heterogeneity files/'
+#Should show barcodes.tsv, genes.tsv, and matrix.mtx
+list.files(data_dir) 
+#Reading in our data files into an expression matrix
+expression_matrix <- Read10X(data.dir = data_dir)
+#Converting the expression matrix into a Seurat Object for further pre-processing
+seurat_object = CreateSeuratObject(counts = expression_matrix)
+#Save the raw expression matrix for Azimuth input
+saveRDS(expression_matrix, file = '/Users/madeleinefalby/Desktop/scRNAseq data/heterogeneity files/ForAzimuth.RDS')
+```
+
+##Histogram of RNA Features
+Shows the amount (frequency) of genes (features of RNA) that are located along the RNA transcript. Here, we are looking for a well defined curve (somewhat normalized). Here we see that the curve is positively skewed. 
+```{r}
+hist(seurat_object$nFeature_RNA)
+```
+
+##Normalizing the Data
+Uses the NormalizeData() function in Seurat. Input is our Seurat object and the method is a Log Normalize. 
+```{r}
+seurat_object <- NormalizeData(seurat_object, normalization.method = "LogNormalize", scale.factor = 1000000)
+
+##Checking our work
+seurat_object@assays$RNA@counts[1:10,1:3]
+seurat_object@assays$RNA@data[1:10,1:3]
+```
+
+##Finding Variable Features
+This function detects the features (or genes) that show the most variability between cells. You must pick the number of features or genes using nfeatures = ____. If this value is too low or too high (ex. randomly selecting 10 genes or 40,000), it will poorly define the variation among genes. Never go lower than 2000 genes. 
+
+When checking your work, var.features[1:5] will show the 5 most variable genes among the 2000 selected features. 
+```{r}
+seurat_object <- FindVariableFeatures(seurat_object, selection.method = "vst", nfeatures = 2000)
+##Check our work
+seurat_object@assays$RNA@var.features[1:5]
+```
+
+##Scaling the Data
+Shifting the expression of each gene, so that the mean expression across cells is 0. Then the expression of each gene is scaled so that the variance across cells is 1 (this helps consider all genes within the set equally, such that highly expressed genes do not count for more in the high level analysis since their variance may be +-100 which may be higher than lower expressed genes).
+```{r}
+seurat_object <- ScaleData(seurat_object)
+```
+
+##Running PCA
+Dimensional Reduction - Principal Component Analysis (PCA): Used for highly correlated variables and finds the one line that best represents the variation of the data. The introduced line or axis can be an assigned value (principal component or PC) which represent the x and y axis values of the variation (which have been reduced). NOTE: the PC values have no meanings 
+
+Definition: Principal component analysis (PCA) is a technique for reducing the dimension of the dataset, increasing interpretability but at the same time minimizing information loss. It does so by creating new uncorrelated variables that successively maximize variance --> simplifies the data so it can be more easily read.
+
+The default number of PCs is 50. The PCs are ordered (1, 2, 3...) by the amount of variation.
+```{r}
+#RunPCA(Seu_obj) will default to variable features.
+seurat_object <- RunPCA(seurat_object, features = seurat_object@assays$RNA@var.features) 
+
+#Creating an elbow plot to see how many dimensions (specifically the upper limit) we should account for when finding neighbors. Here we are specifically looking to identify where the "elbow" of the plot occurs or where the standard deviation begins to plateau.
+ElbowPlot(seurat_object)
+ElbowPlot(seurat_object, ndims=40)
+```
+##Finding Nearest Neighbors and Clusters
+NOTE: For this dataset: upper dim limit of 15 produces 18 communities, upper limit of 20 produces 20 communities, upper limit of 30 produces 23 communities.
+ 
+Here we chose an upper dimension limit of 12 to produce 17 clusters. The resoltuion of 0.5 is recommended by the Seurat 
+```{r}
+seurat_object <- FindNeighbors(seurat_object, dims = 1:12)
+seurat_object <- FindClusters(seurat_object, resolution = 0.5)
+
+#Prints the sample ID and what cluster it belongs to.
+seurat_object$seurat_clusters[1:5] 
+
+#Tells us how many samples belong or are assigned to each cluster under each type of cell class or subclass. 
+table(seurat_object$seurat_clusters) 
+```
+##Running a UMAP and TSNE to visualize clusters
+In this step, we can see if our number of clusters (as determined by the upper dimension limit in the FindNeighbours() function) produces clear groups or if we need to readjust accordingly. 
+```{r}
+#Setting the active identity so that the default of our UMAP and TSNE plots groups cells by our previously determined Seurat clusters (otherwise we would have to specify within the function)
+Idents(seurat_object) <- "seurat_clusters"
+
+#Running UMAP
+seurat_object <- RunUMAP(seurat_object, dims = 1:12)
+UMAP_plot <- DimPlot(seurat_object, reduction = "umap", label = TRUE, repel = TRUE) 
+
+#Running TSNE
+seurat_object <- RunTSNE(seurat_object, dims = 1:12)
+TSNE_plot <- DimPlot(seurat_object, reduction = "tsne", label = TRUE) 
+
+#Produces plots side by side to visualize our clusters
+UMAP_plot + TSNE_plot
+```
+
+##Identify the levels of the seurat object
+By looking at which genes are most predominantly expressed in each cluster, we may be able to assign cell types. We will do this by performing the FindMarkers function for each cluster. This was we can find the most differentially expressed genes in that cluster and see if their expressional pattern points to a specific cell type/class. 
+
+Since we have identified seurat clusters as our active identity, the ident.1 must follow our seurat cluster identities which we wish to analyze.
+
+The logfc threshold looks for the very high genes expressed in the identified cluster (ident.1). This will return genes that is very highly expressed in the identified cluster in comparison to the entire sample. 
+
+The min.pct function looks at the minimum percentage of a gene in either of the two groups. When setting min.pct to 0.10, we are looking for genes that expressed at at least 10% in all cells (this weeds out genes that are expressed at low levels in our cluster of interest and genes that are expressed very highly in all clusters).
+
+The arrange table shows the highest genes that are expressed in our first identified cell. The log2FC (log to fold change) is the difference in gene expression between the clusters (first - second). Pct.1 shows the percent of gene expression in the first identified cluster where pct.2 shows the percent of the same genes in the second identified cluster. 
+
+```{r}
+#Run FindAllMarkers function to see the 5 most uniquely identified genes for each cluster with a min.pct value of 10% (this will find genes that are more discerning between clusters)
+levels(seurat_object)
+Idents(seurat_object) <- "seurat_clusters"
+table(seurat_object$seurat_clusters)
+
+all.markers <- FindAllMarkers(seurat_object, only.pos = TRUE, min.pct = 0.10, logfc.threshold = 0.25)
+
+all.markers.condensed <- all.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+
+all.markers.condensed
+```
+
+```{r}
+#Run FindAllMarkers function to see the 20 most uniquely identified genes for each cluster
+all.markers.condensed.twenty <- all.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 20, order_by = avg_log2FC)
+
+all.markers.condensed.twenty
+
+#save the 20 condensed markers for each cluster
+saveRDS(all.markers.condensed.twenty, file = '/Users/madeleinefalby/Desktop/scRNAseq data/heterogeneity files/condensedtwentymarkers.RDS')
+
+#save the all markers file
+saveRDS(all.markers, file = '/Users/madeleinefalby/Desktop/scRNAseq data/heterogeneity files/allmarkers.RDS')
+```
+
+
+
+##Manually Assigning IDs based on Condensed Markers for Each Cluster
+To do this, we can use the FindMarkers() function to look at a specific cluster identity versus all other cells. Some clusters had differential gene expression patterns that could be predicted without using a reference dataset. Some examples are shown here for Cluster 0, 1, 3, 4, 5, and 6. 
+
+#Cluster 0
+AC108721.2, SH3TC2-DT, LINC01608, ST18, FOLH1 --> oligodendrocytes
+```{r}
+#comparing cluster 0 to the rest of the population
+zero_vs_all_markers <- FindMarkers(seurat_object, ident.1 = "0", logfc.threshold = 0.25, min.pct = 0.25)
+
+#arranging table to show genes that appear most in our identified group
+zero_vs_all_markers %>%
+   arrange(desc(avg_log2FC))
+```
+
+#Cluster 1
+LNCAROD, DOCK8, APBB1IP, CD86, LINC02712 --> microglia
+```{r}
+#comparing cluster 0 to the rest of the population
+one_vs_all_markers <- FindMarkers(seurat_object, ident.1 = "1", logfc.threshold = 0.25, min.pct = 0.25)
+#arranging table to show genes that appear most in our identified group
+one_vs_all_markers %>%
+   arrange(desc(avg_log2FC))
+```
+
+#Cluster 3
+ AC004852.2, MROH9, BX284613.2, VCAN-AS1, FERMT1 --> oligodendrocyte progenitor cells (OPC)
+```{r}
+#comparing cluster 0 to the rest of the population
+three_vs_all_markers <- FindMarkers(seurat_object, ident.1 = "3", logfc.threshold = 0.25, min.pct = 0.25)
+#arranging table to show genes that appear most in our identified group
+three_vs_all_markers %>%
+   arrange(desc(avg_log2FC))
+```
+
+#Cluster 4
+AC011990.1, AC016766.1, AC012409.2, NR2F2-AS1, LAMA3 --> Inhibitory layer 6
+```{r}
+#comparing cluster 0 to the rest of the population
+four_vs_all_markers <- FindMarkers(seurat_object, ident.1 = "4", logfc.threshold = 0.25, min.pct = 0.25)
+#arranging table to show genes that appear most in our identified group
+four_vs_all_markers %>%
+   arrange(desc(avg_log2FC))
+```
+
+#Cluster 5
+ AL353604.1, AL136985.3, ST6GALNAC5, AC117944.1, CCN1 --> excitatory layer 3 
+```{r}
+#comparing cluster 0 to the rest of the population
+five_vs_all_markers <- FindMarkers(seurat_object, ident.1 = "5", logfc.threshold = 0.25, min.pct = 0.25)
+#arranging table to show genes that appear most in our identified group
+five_vs_all_markers %>%
+   arrange(desc(avg_log2FC))
+```
+
+#Cluster 6
+ KLF5, GRIK1, AC117461.1, NMU, FLT3	--> Inhibitiory layer 4 (SST)
+```{r}
+#comparing cluster 0 to the rest of the population
+six_vs_all_markers <- FindMarkers(seurat_object, ident.1 = "6", logfc.threshold = 0.25, min.pct = 0.25)
+#arranging table to show genes that appear most in our identified group
+six_vs_all_markers %>%
+   arrange(desc(avg_log2FC))
+```
+
+
+
+##Reading in the predictions from Azimuth
+Using Azimuth, a reference meta data file can be downloaded. By inputting our expression matrix into Azimuth predictions (previously made file labelled "ForAzimuth.RDS"), our cells can be aligned to a reference dataset (for this we chose human motor cortex). A meta data file can then be downloaded which includes predictions of cell idenities and attached to our seurat object.  
+```{r}
+#Reading in our azimuth predictions meta data file downloaded from the website 
+azimuth_predictions <- read.table("azimuth_pred.tsv", sep = "\t", row.names = 1, header = TRUE)
+
+#Attaching the meta data file to our seurat object
+seurat_object <- AddMetaData(
+	object = seurat_object,
+	metadata = azimuth_predictions)
+
+#We can now call on a newly formed "predicted subclass" column which used the Azimuth reference data set to predict the subclass of our cells. 
+Idents(seurat_object) <- "predicted.subclass"
+
+#UMAP of the predictions will show us our clusters labeled by the active identity of predicted subclass
+umap_pred <- DimPlot(object = seurat_object, reduction = "umap", label = TRUE, label.size = 3, repel = FALSE)
+
+#Creating a data frame will allow us to see how our seurat clusters separated cells and compare those results to the predicted subclasses as provided by Azimuth
+predicted.table <- as.data.frame(table(seurat_object$predicted.subclass, seurat_object$seurat_clusters))
+
+#Visualize the UMAP of our clusters and compare the labels of predicted subclass to labels of cluster identities
+umap_pred + UMAP_plot
+```
+
+
+##Bar Graph showing the percent of cells within each predicted subclass for our data versus the Azimuth Reference of the human motor cortex. 
+This will show us which subclass of cells may be over or underrepresented by our sample as compared to the reference. We ended up seeing a large percentage of oligodendrocytes in our data which may indicate biological differences in sample collection. Tissue may have been inadvertently cut to contain a large proportion of white matter (more myelin would reflect an increased oligodendrocyte population). 
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+
+# read in metadata from reference data from human motor cortex (this is obtained from the azimuth website and is separate from the azimuth_pred.tsv file)
+reference.data <- read.csv("metadata.csv")
+
+# this creates new columns so that they match with names from azimuth predictions
+# also create a new column named dataset with every value called "reference"
+reference.data <- reference.data %>% mutate(predicted.subclass = subclass_label,
+                          predicted.class = class_label,
+                          predicted.cluster = cluster_label,
+                          dataset = "reference")
+
+# this names a new column name called sample_name
+azimuth_predictions <- azimuth_predictions %>% rownames_to_column(var = "sample_name")
+
+# this makes a new column called dataset named "madeleine"
+azimuth_predictions <- azimuth_predictions %>%
+  mutate(dataset = "madeleine")
+
+# this binds the two metadata data frames together and filters cells from azimuth predictions based on a greater than 80% confidence score of the prediction 
+combined_dataset <- bind_rows(reference.data, 
+                              azimuth_predictions %>% filter(predicted.subclass.score>0.8)) 
+
+# this creates a new column in metadata with count of numbers of cells per dataset
+# this also creates a new column called percent with percentage of cells per type per dataset
+# this also gets distinct dataset names and predicted.subclass names
+cell_percentages_per_dataset = combined_dataset %>% group_by(dataset) %>% mutate(cells_per_dataset = n()) %>% ungroup() %>% 
+  group_by(dataset, predicted.subclass) %>% mutate(percent = n()/cells_per_dataset * 100) %>% 
+  distinct(dataset, predicted.subclass, .keep_all = T) 
+
+#this creates a ggplot of a bar graph that shows cell percentage by predicted subclass and further divided by cell class for our dataset in comparison to the reference
+cell_percentages_per_dataset %>% ggplot(aes(x = predicted.subclass, y = percent, fill = dataset)) + 
+  geom_bar(stat = "identity", position = position_dodge()) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  facet_wrap(~predicted.class, scales = "free_x") + xlab("Predicted Subclass") + ylab("Percent Cell Expression")
+
+```
+
+##Bar Graph showing the percent of cells within each predicted subclass for our data versus the Azimuth Reference of the human motor cortex as well as the AD (MTG) reference
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+
+#read in metadata from reference data from human MTG for AD patients
+reference.AD.data <- read.csv("seaad_cell_metadata.csv")
+
+#this creates new columns so that they match with names from azimuth predictions
+#also create a new column named dataset with every value called "reference"
+reference.AD.data <- reference.AD.data %>% mutate(predicted.subclass = subclass_label, 
+                          predicted.class = class_label,
+                          predicted.cluster = cluster_label,
+                          dataset = "AD reference")
+
+#since the second reference dataset, from the AD population, had different names for classes and subclasses, we changed them to match our data and the Azimuth references
+reference.AD.data <- reference.AD.data %>% 
+  mutate(predicted.class = str_remove(predicted.class, "Neuronal: ")) %>%
+   mutate(predicted.class = str_remove(predicted.class, " and Non-neural")) %>%
+   mutate(predicted.class = str_replace(predicted.class, "Non-neuronal", "Non-Neuronal")) %>%
+   mutate(predicted.subclass = str_replace(predicted.subclass, "Oligodendrocyte", "Oligo")) %>% 
+  mutate(predicted.subclass = str_replace(predicted.subclass, "Microglia-PVM", "Micro-PVM")) %>%
+  mutate(predicted.subclass = str_replace(predicted.subclass, "Endothelial", "Endo")) %>%
+  mutate(predicted.subclass = str_replace(predicted.subclass, "Asrtocyte", "Astro")) %>%
+  filter(!is.na(predicted.class), !is.na(predicted.subclass))
+
+#this binds the three metadata data frames together and filters cells from azimuth predictions
+three_combined_dataset <- bind_rows(reference.data, reference.AD.data, azimuth_predictions %>% filter(predicted.subclass.score>0.8)) %>% mutate(dataset = factor(dataset, levels = c("madeleine", "reference", "AD reference"))) 
+
+#Some of the AD reference dataset had predicted subclasses that were not included in the other two, therefore here we tally up the values of predicted subclass to see if they appear in more than one of our datasets. All predicted subclasses that appear in more than one dataset are turned into a vector. 
+three_combined_multisubclass <- three_combined_dataset %>% group_by(dataset, predicted.subclass) %>% tally() %>% group_by(predicted.subclass) %>% tally() %>% filter(n>1) %>% .$predicted.subclass
+
+#The vector made previously is then filtered into our combine datasets to be plotted
+three_combined_dataset <- three_combined_dataset %>% filter(predicted.subclass %in% three_combined_multisubclass)
+
+# this creates a new column in metadata with count of numbers of cells per dataset
+# this also creates a new column called percent with percentage of cells per type per dataset
+# this also gets distinct dataset names and predicted.subclass names
+cell_percentages_per_dataset = three_combined_dataset %>% group_by(dataset) %>% mutate(cells_per_dataset = n()) %>% ungroup() %>% 
+  group_by(dataset, predicted.subclass) %>% mutate(percent = n()/cells_per_dataset * 100)  %>% distinct(dataset, predicted.subclass, .keep_all = T) 
+
+#this creates a ggplot of a bar graph that shows cell percentage by predicted subclass and further divided by cell class for our dataset in comparison to the references
+cell_percentages_per_dataset %>% ggplot(aes(x = predicted.subclass, y = percent, fill = dataset)) + 
+  geom_bar(stat = "identity", position = position_dodge()) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  facet_wrap(~predicted.class, scales = "free_x") +
+  xlab("Predicted Subclass") + ylab("Percent Cell Expression")
+
+```
+##BoxPlot for RNA expression for various predicted subclasses
+Shows the RNA counts for each predicted subclass for our dataset further grouped by class.  RNA counts are the the total number of molecules detected within a cell (correlates strongly with unique genes). 
+```{r}
+boxplot <- seurat_object@meta.data %>% filter(!is.na(predicted.subclass)) %>% ggplot(aes(x = predicted.subclass, y = nCount_RNA, fill = predicted.subclass)) + geom_boxplot() + theme_minimal() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), legend.position = "none")  + facet_wrap(~predicted.class, scales = "free_x") + xlab("Predicted Subclass") + ylab("RNA Counts") 
+
+boxplot
+```
+
+##Looking at the variation of gene expression for a specific gene within predicted subclasses.
+To calculate homogenization of specific genes (features) we will first quantify the amount RNA counts of a specific gene for all cells within each predicted subclass. Then the standard deviation of RNA counts for each subclass will be plotted. In the future, when we have comparable samples, we will plot a reference or control group beside our experimental tissue results to compare changes in variability of specific features. 
+```{r}
+Idents(seurat_object) <- "predicted.subclass"
+
+#FetchData can pull anything from expression matrices, cell embeddings, or metadata. Specifically looking at the HCN1 channel gene. We are asking to fetch data from our active ident (predicted subclass) and HCN1 RNA counts within our seurat_object. 
+HCN1_variability <- FetchData(object = seurat_object, vars = c("ident","HCN1"))
+
+#Here we are determining the variability of HCN1 based on the standard deviation of HCN1 RNA counts for all cells within each predicted subclass
+HCN1_variability <- HCN1_variability %>% group_by(ident) %>% summarize(SD = sd(HCN1))
+
+#Plotting the variability of HCN1 gene with values for standard deviation in the y axis
+HCN1_variability %>% filter(!is.na(ident)) %>% 
+  ggplot(aes(x = ident, y = SD, fill = ident)) + 
+  geom_bar(stat = "identity", position = position_dodge()) + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  +    
+  xlab("Predicted Subclass") + ylab("Standard Deviation of HCN1 gene expression")
+
+```
+
